@@ -50,9 +50,13 @@ private slots:
     void removeCurrentSettings();
     void editCurrentSettings();
     void testDownload();
+    void applyTemplate(int index);
 
 private:
     void updateSettingsList();
+    void updateAutoSyncRemotes();
+    void loadAutoSyncSettings();
+    bool saveAutoSyncSettings();
     QListWidgetItem* findItemByName(const QString& name);
     void clearFields();
 

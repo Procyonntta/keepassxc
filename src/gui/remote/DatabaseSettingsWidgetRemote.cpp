@@ -18,14 +18,30 @@
 #include "DatabaseSettingsWidgetRemote.h"
 #include "ui_DatabaseSettingsWidgetRemote.h"
 
+#include "core/Database.h"
 #include "core/Global.h"
 #include "core/Metadata.h"
 
 #include "RemoteHandler.h"
 #include "RemoteSettings.h"
+#include "RemoteSyncScheduler.h"
 #include "gui/MessageBox.h"
 
 #include <QFile>
+#include <QFileInfo>
+
+namespace
+{
+    enum CommandTemplate
+    {
+        NoTemplate,
+        RcloneTemplate,
+        ScpTemplate
+    };
+
+    // Cloud storage is often slower than the default timeout allows
+    constexpr int TemplateTimeoutSec = 30;
+} // namespace
 
 DatabaseSettingsWidgetRemote::DatabaseSettingsWidgetRemote(QWidget* parent)
     : DatabaseSettingsWidget(parent)
@@ -43,6 +59,14 @@ DatabaseSettingsWidgetRemote::DatabaseSettingsWidgetRemote(QWidget* parent)
             this,
             &DatabaseSettingsWidgetRemote::editCurrentSettings);
     connect(m_ui->testDownloadCommandButton, &QPushButton::clicked, this, &DatabaseSettingsWidgetRemote::testDownload);
+
+    m_ui->templateComboBox->addItem(tr("Choose a template…"), NoTemplate);
+    m_ui->templateComboBox->addItem(tr("rclone (Google Drive, Dropbox, OneDrive, WebDAV, S3, …)"), RcloneTemplate);
+    m_ui->templateComboBox->addItem(tr("scp (SSH server)"), ScpTemplate);
+    connect(m_ui->templateComboBox,
+            QOverload<int>::of(&QComboBox::activated),
+            this,
+            &DatabaseSettingsWidgetRemote::applyTemplate);
 
     auto setModified = [this]() { m_modified = true; };
     connect(m_ui->nameLineEdit, &QLineEdit::textChanged, setModified);
@@ -67,6 +91,7 @@ void DatabaseSettingsWidgetRemote::initialize()
     } else {
         m_ui->removeSettingsButton->setDisabled(true);
     }
+    loadAutoSyncSettings();
 }
 
 void DatabaseSettingsWidgetRemote::uninitialize()
@@ -88,6 +113,9 @@ bool DatabaseSettingsWidgetRemote::saveSettings()
         }
     }
 
+    if (!saveAutoSyncSettings()) {
+        return false;
+    }
     m_remoteSettings->saveSettings();
     return true;
 }
@@ -166,6 +194,106 @@ void DatabaseSettingsWidgetRemote::updateSettingsList()
         item->setText(params->name);
         m_ui->settingsListWidget->addItem(item);
     }
+    updateAutoSyncRemotes();
+}
+
+void DatabaseSettingsWidgetRemote::updateAutoSyncRemotes()
+{
+    auto current = m_ui->autoSyncRemoteComboBox->currentText();
+    m_ui->autoSyncRemoteComboBox->clear();
+    for (auto params : m_remoteSettings->getAllRemoteParams()) {
+        m_ui->autoSyncRemoteComboBox->addItem(params->name);
+    }
+
+    int index = m_ui->autoSyncRemoteComboBox->findText(current);
+    if (index >= 0) {
+        m_ui->autoSyncRemoteComboBox->setCurrentIndex(index);
+    }
+}
+
+void DatabaseSettingsWidgetRemote::loadAutoSyncSettings()
+{
+    // A database that was never saved has no file to bind the setting to
+    auto filePath = m_db ? m_db->canonicalFilePath() : QString();
+    m_ui->autoSyncGroupBox->setEnabled(!filePath.isEmpty());
+
+    auto settings = RemoteSyncScheduler::settings(filePath);
+    m_ui->autoSyncGroupBox->setChecked(settings.isEnabled());
+    if (!settings.isEnabled()) {
+        return;
+    }
+
+    int index = m_ui->autoSyncRemoteComboBox->findText(settings.remoteName);
+    if (index >= 0) {
+        m_ui->autoSyncRemoteComboBox->setCurrentIndex(index);
+    }
+    m_ui->autoSyncOnUnlockCheckBox->setChecked(settings.onUnlock);
+    m_ui->autoSyncOnSaveCheckBox->setChecked(settings.onSave);
+    m_ui->autoSyncIntervalSpinBox->setValue(settings.intervalMin);
+}
+
+bool DatabaseSettingsWidgetRemote::saveAutoSyncSettings()
+{
+    if (!m_db || m_db->canonicalFilePath().isEmpty()) {
+        return true;
+    }
+
+    AutoSyncSettings settings;
+    if (m_ui->autoSyncGroupBox->isChecked()) {
+        settings.remoteName = m_ui->autoSyncRemoteComboBox->currentText();
+        settings.onUnlock = m_ui->autoSyncOnUnlockCheckBox->isChecked();
+        settings.onSave = m_ui->autoSyncOnSaveCheckBox->isChecked();
+        settings.intervalMin = m_ui->autoSyncIntervalSpinBox->value();
+        if (!settings.isEnabled()) {
+            m_ui->messageWidget->showMessage(tr("Choose a sync command and at least one moment to sync automatically."),
+                                             MessageWidget::Warning);
+            return false;
+        }
+    }
+
+    RemoteSyncScheduler::setSettings(m_db->canonicalFilePath(), settings);
+    return true;
+}
+
+void DatabaseSettingsWidgetRemote::applyTemplate(int index)
+{
+    auto commandTemplate = m_ui->templateComboBox->itemData(index).toInt();
+    m_ui->templateComboBox->setCurrentIndex(0);
+    if (commandTemplate == NoTemplate) {
+        return;
+    }
+
+    // Name the remote file like the local one, the user adjusts the location
+    auto fileName = m_db ? QFileInfo(m_db->filePath()).fileName() : QString();
+    if (fileName.isEmpty()) {
+        fileName = QStringLiteral("Database.kdbx");
+    }
+
+    QString name;
+    QString remoteFile;
+    if (commandTemplate == RcloneTemplate) {
+        name = QStringLiteral("rclone");
+        remoteFile = QStringLiteral("remote:%1").arg(fileName);
+        m_ui->downloadCommand->setText(QStringLiteral("rclone copyto \"%1\" \"{TEMP_DATABASE}\"").arg(remoteFile));
+        m_ui->uploadCommand->setText(QStringLiteral("rclone copyto \"{TEMP_DATABASE}\" \"%1\"").arg(remoteFile));
+    } else {
+        name = QStringLiteral("scp");
+        remoteFile = QStringLiteral("user@hostname:%1").arg(fileName);
+        m_ui->downloadCommand->setText(QStringLiteral("scp \"%1\" \"{TEMP_DATABASE}\"").arg(remoteFile));
+        m_ui->uploadCommand->setText(QStringLiteral("scp \"{TEMP_DATABASE}\" \"%1\"").arg(remoteFile));
+    }
+
+    m_ui->inputForDownload->clear();
+    m_ui->inputForUpload->clear();
+    m_ui->downloadTimeoutSec->setValue(TemplateTimeoutSec);
+    m_ui->uploadTimeoutSec->setValue(TemplateTimeoutSec);
+    if (m_ui->nameLineEdit->text().isEmpty()) {
+        m_ui->nameLineEdit->setText(name);
+    }
+
+    m_ui->messageWidget->showMessage(
+        tr("Replace %1 with the location of your database in both commands, then press Save.").arg(remoteFile),
+        MessageWidget::Information);
 }
 
 void DatabaseSettingsWidgetRemote::clearFields()
@@ -182,19 +310,19 @@ void DatabaseSettingsWidgetRemote::clearFields()
 
 void DatabaseSettingsWidgetRemote::testDownload()
 {
-    auto* params = new RemoteParams();
-    params->name = m_ui->nameLineEdit->text();
-    params->downloadCommand = m_ui->downloadCommand->text();
-    params->downloadInput = m_ui->inputForDownload->toPlainText();
-    params->downloadTimeoutMsec = m_ui->downloadTimeoutSec->value() * 1000;
+    RemoteParams params;
+    params.name = m_ui->nameLineEdit->text();
+    params.downloadCommand = m_ui->downloadCommand->text();
+    params.downloadInput = m_ui->inputForDownload->toPlainText();
+    params.downloadTimeoutMsec = m_ui->downloadTimeoutSec->value() * 1000;
 
-    QScopedPointer<RemoteHandler> remoteHandler(new RemoteHandler(this));
-    if (params->downloadCommand.isEmpty()) {
+    QScopedPointer<RemoteHandler> remoteHandler(new RemoteHandler());
+    if (params.downloadCommand.isEmpty()) {
         m_ui->messageWidget->showMessage(tr("Download command cannot be empty."), MessageWidget::Warning);
         return;
     }
 
-    RemoteHandler::RemoteResult result = remoteHandler->download(params);
+    RemoteHandler::RemoteResult result = remoteHandler->download(&params);
     if (!result.success) {
         m_ui->messageWidget->showMessage(tr("Download failed with error: %1").arg(result.errorMessage),
                                          MessageWidget::Error);
@@ -207,5 +335,7 @@ void DatabaseSettingsWidgetRemote::testDownload()
         return;
     }
 
+    // Only checking that the command works, the copy is not needed
+    QFile::remove(result.filePath);
     m_ui->messageWidget->showMessage(tr("Download successful."), MessageWidget::Positive);
 }

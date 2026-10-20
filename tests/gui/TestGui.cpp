@@ -21,7 +21,9 @@
 
 #include <QCheckBox>
 #include <QClipboard>
+#include <QComboBox>
 #include <QDialog>
+#include <QGroupBox>
 #include <QListWidget>
 #include <QMenu>
 #include <QMenuBar>
@@ -34,6 +36,9 @@
 #include <QTableWidget>
 #include <QTest>
 #include <QToolBar>
+#include <QToolButton>
+
+#include <atomic>
 
 #include "config-keepassx-tests.h"
 #include "core/PasswordHealth.h"
@@ -63,6 +68,8 @@
 #include "gui/group/GroupModel.h"
 #include "gui/group/GroupView.h"
 #include "gui/remote/RemoteHandler.h"
+#include "gui/remote/RemoteSettings.h"
+#include "gui/remote/RemoteSyncScheduler.h"
 #include "gui/tag/TagsEdit.h"
 #include "gui/wizard/NewDatabaseWizard.h"
 #include "keys/FileKey.h"
@@ -75,6 +82,70 @@
 #define TEST_MODAL(TEST_CODE)                                                                                          \
     TEST_MODAL_NO_WAIT(TEST_CODE);                                                                                     \
     QTRY_VERIFY(dialogFinished)
+
+namespace
+{
+    // Remote storage backed by a local file: "download" copies it to the temporary database, "upload" back
+    class FileRemoteProcess : public RemoteProcess
+    {
+    public:
+        static inline QString remotePath;
+        static inline std::atomic<int> downloads{0};
+        static inline std::atomic<int> uploads{0};
+
+        explicit FileRemoteProcess(QObject* parent)
+            : RemoteProcess(parent)
+        {
+        }
+
+        void start(const QString& command) override
+        {
+            if (command == "download") {
+                ++downloads;
+                m_success = QFile::copy(remotePath, m_tempFileLocation);
+            } else {
+                ++uploads;
+                QFile::remove(remotePath);
+                m_success = QFile::copy(m_tempFileLocation, remotePath);
+            }
+        }
+        qint64 write(const QString& input) override
+        {
+            return input.length();
+        }
+        bool waitForBytesWritten() override
+        {
+            return true;
+        }
+        void closeWriteChannel() override
+        {
+        }
+        bool waitForFinished(int) override
+        {
+            return true;
+        }
+        int exitCode() const override
+        {
+            return m_success ? 0 : 1;
+        }
+        QString readOutput() override
+        {
+            return {};
+        }
+        QString readError() override
+        {
+            return {};
+        }
+
+    private:
+        bool m_success = false;
+    };
+
+    int countTemporaryRemoteDatabases()
+    {
+        return QDir::temp().entryList({"RemoteDatabase-*.kdbx"}, QDir::Files).size();
+    }
+} // namespace
 
 int main(int argc, char* argv[])
 {
@@ -542,6 +613,197 @@ void TestGui::testOpenRemoteDatabase()
 
     // remote database has been opened
     QTRY_COMPARE(m_tabWidget->tabText(m_tabWidget->currentIndex()), QString("SyncDatabase [Temporary]"));
+}
+
+Entry* TestGui::addLocalEntryForSync()
+{
+    auto entry = new Entry();
+    entry->setUuid(QUuid::createUuid());
+    entry->setTitle("Created locally");
+    entry->setGroup(m_db->rootGroup());
+    return entry;
+}
+
+bool TestGui::remoteDatabaseContains(const Entry* entry)
+{
+    auto remoteDb = QSharedPointer<Database>::create();
+    return remoteDb->open(m_remoteDbFile.fileName(), m_db->key())
+           && remoteDb->rootGroup()->findEntryByUuid(entry->uuid());
+}
+
+void TestGui::setupAutoSync(bool onUnlock, bool onSave)
+{
+    auto remoteSource = QDir(KEEPASSX_TEST_DATA_DIR).absoluteFilePath("SyncDatabase.kdbx");
+    QVERIFY(m_remoteDbFile.copyFromFile(remoteSource));
+    FileRemoteProcess::remotePath = m_remoteDbFile.fileName();
+    FileRemoteProcess::downloads = 0;
+    FileRemoteProcess::uploads = 0;
+    RemoteHandler::setRemoteProcessFunc(
+        [](QObject* parent) { return QScopedPointer<RemoteProcess>(new FileRemoteProcess(parent)); });
+    RemoteSyncScheduler::setSaveDelay(50);
+
+    // The commands are stored in the database, save it before opting in so that nothing syncs yet
+    RemoteSettings remoteSettings(m_db);
+    auto params = new RemoteParams{"testRemote", "download", {}, 10000, "upload", {}, 10000};
+    remoteSettings.addRemoteParams(params);
+    remoteSettings.saveSettings();
+    QTRY_COMPARE(m_dbWidget->getRemoteParams().size(), 1);
+    QVERIFY(m_dbWidget->save());
+
+    AutoSyncSettings autoSync;
+    autoSync.remoteName = "testRemote";
+    autoSync.onUnlock = onUnlock;
+    autoSync.onSave = onSave;
+    RemoteSyncScheduler::setSettings(m_db->canonicalFilePath(), autoSync);
+    QCOMPARE(m_dbWidget->autoSyncState(), DatabaseWidget::AutoSyncState::Idle);
+}
+
+void TestGui::testAutoSyncRequiresLocalOptIn()
+{
+    setupAutoSync(true, true);
+    // Revoke the opt-in on this device, the commands stay in the database
+    RemoteSyncScheduler::setSettings(m_db->canonicalFilePath(), {});
+    QCOMPARE(m_dbWidget->autoSyncState(), DatabaseWidget::AutoSyncState::Disabled);
+
+    QVERIFY(m_dbWidget->lock());
+    m_dbWidget->performUnlockDatabase("a");
+    QTRY_VERIFY(!m_dbWidget->isLocked());
+    m_db = m_dbWidget->database();
+
+    m_db->metadata()->setName("changed");
+    QVERIFY(m_dbWidget->save());
+    m_dbWidget->autoSyncNow();
+
+    QTest::qWait(200);
+    QCOMPARE(FileRemoteProcess::downloads.load(), 0);
+    QCOMPARE(FileRemoteProcess::uploads.load(), 0);
+    QVERIFY(!m_mainWindow->findChild<QToolButton*>("syncStatusButton")->isVisible());
+}
+
+void TestGui::testAutoSyncOnUnlock()
+{
+    int tempFiles = countTemporaryRemoteDatabases();
+    setupAutoSync(true, false);
+    auto entryUuid = addLocalEntryForSync()->uuid();
+    QVERIFY(m_dbWidget->save());
+
+    QVERIFY(m_dbWidget->lock());
+    m_dbWidget->performUnlockDatabase("a");
+    QTRY_VERIFY(!m_dbWidget->isLocked());
+    m_db = m_dbWidget->database();
+
+    QTRY_COMPARE(m_dbWidget->autoSyncState(), DatabaseWidget::AutoSyncState::Succeeded);
+    QCOMPARE(FileRemoteProcess::downloads.load(), 1);
+    QCOMPARE(FileRemoteProcess::uploads.load(), 1);
+
+    // The remote changes were merged and saved, the local entry was uploaded
+    QCOMPARE(m_db->rootGroup()->children().size(), 7);
+    QCOMPARE(m_db->rootGroup()->findChildByName("General")->entries().size(), 1);
+    QVERIFY(!m_db->isModified());
+    QVERIFY(remoteDatabaseContains(m_db->rootGroup()->findEntryByUuid(entryUuid)));
+
+    auto statusButton = m_mainWindow->findChild<QToolButton*>("syncStatusButton");
+    QVERIFY(statusButton->isVisible());
+    QVERIFY(statusButton->text().startsWith("Synced"));
+    QCOMPARE(countTemporaryRemoteDatabases(), tempFiles);
+}
+
+void TestGui::testAutoSyncAfterSave()
+{
+    setupAutoSync(false, true);
+
+    // A burst of saves results in a single sync
+    auto entry = addLocalEntryForSync();
+    QVERIFY(m_dbWidget->save());
+    m_db->metadata()->setName("Saved twice");
+    QVERIFY(m_dbWidget->save());
+
+    QTRY_COMPARE(m_dbWidget->autoSyncState(), DatabaseWidget::AutoSyncState::Succeeded);
+    // The save done by the sync itself must not trigger another sync
+    QTest::qWait(300);
+    QCOMPARE(FileRemoteProcess::downloads.load(), 1);
+    QCOMPARE(FileRemoteProcess::uploads.load(), 1);
+
+    QVERIFY(remoteDatabaseContains(entry));
+}
+
+void TestGui::testAutoSyncSkipsUploadWithoutChanges()
+{
+    setupAutoSync(true, false);
+    addLocalEntryForSync();
+    QVERIFY(m_dbWidget->save());
+
+    m_dbWidget->autoSyncNow();
+    QTRY_COMPARE(m_dbWidget->autoSyncState(), DatabaseWidget::AutoSyncState::Succeeded);
+    QCOMPARE(FileRemoteProcess::uploads.load(), 1);
+
+    // Both sides are identical now
+    m_dbWidget->autoSyncNow();
+    QTRY_COMPARE(FileRemoteProcess::downloads.load(), 2);
+    QTRY_COMPARE(m_dbWidget->autoSyncState(), DatabaseWidget::AutoSyncState::Succeeded);
+    QCOMPARE(FileRemoteProcess::uploads.load(), 1);
+    QVERIFY(!m_db->isModified());
+}
+
+void TestGui::testAutoSyncDeferredWhileEditing()
+{
+    setupAutoSync(true, false);
+
+    triggerAction("actionEntryNew");
+    QCOMPARE(m_dbWidget->currentMode(), DatabaseWidget::Mode::EditEntryMode);
+    m_dbWidget->autoSyncNow();
+    QTest::qWait(200);
+    QCOMPARE(FileRemoteProcess::downloads.load(), 0);
+
+    // Leaving the editor runs the postponed sync
+    m_dbWidget->switchToMainView(false);
+    QTRY_COMPARE(m_dbWidget->autoSyncState(), DatabaseWidget::AutoSyncState::Succeeded);
+    QCOMPARE(FileRemoteProcess::downloads.load(), 1);
+}
+
+void TestGui::testAutoSyncSettings()
+{
+    triggerAction("actionDatabaseSettings");
+    auto dbSettingsDialog = m_dbWidget->findChild<DatabaseSettingsDialog*>("databaseSettingsDialog");
+    QVERIFY(dbSettingsDialog);
+    dbSettingsDialog->showRemoteSettings();
+
+    // The rclone template fills in both commands
+    auto templateComboBox = dbSettingsDialog->findChild<QComboBox*>("templateComboBox");
+    QVERIFY(templateComboBox);
+    QVERIFY(templateComboBox->isVisible());
+    emit templateComboBox->activated(1);
+    QCOMPARE(templateComboBox->currentIndex(), 0);
+
+    auto downloadCommand = dbSettingsDialog->findChild<QLineEdit*>("downloadCommand")->text();
+    auto uploadCommand = dbSettingsDialog->findChild<QLineEdit*>("uploadCommand")->text();
+    QVERIFY(downloadCommand.startsWith("rclone copyto"));
+    QVERIFY(downloadCommand.endsWith("\"{TEMP_DATABASE}\""));
+    QVERIFY(uploadCommand.startsWith("rclone copyto \"{TEMP_DATABASE}\""));
+    QCOMPARE(dbSettingsDialog->findChild<QLineEdit*>("nameLineEdit")->text(), QString("rclone"));
+    QCOMPARE(dbSettingsDialog->findChild<QSpinBox*>("downloadTimeoutSec")->value(), 30);
+
+    QTest::mouseClick(dbSettingsDialog->findChild<QPushButton*>("saveSettingsButton"), Qt::LeftButton);
+
+    auto autoSyncGroupBox = dbSettingsDialog->findChild<QGroupBox*>("autoSyncGroupBox");
+    QVERIFY(autoSyncGroupBox);
+    QVERIFY(autoSyncGroupBox->isEnabled());
+    QVERIFY(!autoSyncGroupBox->isChecked());
+    autoSyncGroupBox->setChecked(true);
+    QCOMPARE(dbSettingsDialog->findChild<QComboBox*>("autoSyncRemoteComboBox")->currentText(), QString("rclone"));
+
+    auto okButton = dbSettingsDialog->findChild<QDialogButtonBox*>("buttonBox")->button(QDialogButtonBox::Ok);
+    QTest::mouseClick(okButton, Qt::LeftButton);
+
+    auto settings = RemoteSyncScheduler::settings(m_db->canonicalFilePath());
+    QVERIFY(settings.isEnabled());
+    QCOMPARE(settings.remoteName, QString("rclone"));
+    QVERIFY(settings.onUnlock);
+    QVERIFY(settings.onSave);
+    QCOMPARE(settings.intervalMin, 15);
+
+    QCOMPARE(m_dbWidget->autoSyncState(), DatabaseWidget::AutoSyncState::Idle);
+    QTRY_VERIFY(m_mainWindow->findChild<QToolButton*>("syncStatusButton")->isVisible());
 }
 
 void TestGui::testAutoreloadDatabase()

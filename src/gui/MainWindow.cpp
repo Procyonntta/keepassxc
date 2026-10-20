@@ -651,6 +651,15 @@ MainWindow::MainWindow()
     m_actionMultiplexer.connect(SIGNAL(databaseSyncInProgress()), this, SLOT(disableMenuAndToolbar()));
     m_actionMultiplexer.connect(SIGNAL(databaseSyncCompleted(QString)), this, SLOT(enableMenuAndToolbar()));
     m_actionMultiplexer.connect(SIGNAL(databaseSyncFailed(QString, const QString)), this, SLOT(enableMenuAndToolbar()));
+    m_syncStatusButton = new QToolButton(statusBar());
+    m_syncStatusButton->setObjectName("syncStatusButton");
+    m_syncStatusButton->setAutoRaise(true);
+    m_syncStatusButton->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    m_syncStatusButton->setIcon(icons()->icon("remote-sync"));
+    m_syncStatusButton->setVisible(false);
+    statusBar()->addPermanentWidget(m_syncStatusButton);
+    m_actionMultiplexer.connect(m_syncStatusButton, SIGNAL(clicked()), SLOT(autoSyncNow()));
+    m_actionMultiplexer.connect(SIGNAL(autoSyncStateChanged()), this, SLOT(updateAutoSyncStatus()));
     m_statusBarLabel = new QLabel(statusBar());
     m_statusBarLabel->setObjectName("statusBarLabel");
     statusBar()->addPermanentWidget(m_statusBarLabel);
@@ -1223,6 +1232,12 @@ void MainWindow::updateRemoteSyncMenuEntries()
         auto action = m_ui->menuRemoteSync->addAction(tr("Setup Remote Sync…"));
         connect(action, &QAction::triggered, dbWidget, &DatabaseWidget::switchToRemoteSettings);
 
+        if (dbWidget->autoSyncState() != DatabaseWidget::AutoSyncState::Disabled) {
+            auto syncNowAction = m_ui->menuRemoteSync->addAction(tr("Sync Now"));
+            syncNowAction->setEnabled(dbWidget->autoSyncState() != DatabaseWidget::AutoSyncState::InProgress);
+            connect(syncNowAction, &QAction::triggered, dbWidget, &DatabaseWidget::autoSyncNow);
+        }
+
         m_ui->menuRemoteSync->addSeparator();
 
         // Build remote sync menu
@@ -1286,6 +1301,7 @@ void MainWindow::databaseTabChanged(int tabIndex)
 
     m_actionMultiplexer.setCurrentObject(m_ui->tabWidget->currentDatabaseWidget());
     updateEntryCountLabel();
+    updateAutoSyncStatus();
 
     // Clear the tags menu to prevent re-use between databases
     for (const auto action : m_ui->menuTags->actions()) {
@@ -1597,6 +1613,40 @@ void MainWindow::updateEntryCountLabel()
     } else {
         m_statusBarLabel->setText("");
     }
+}
+
+void MainWindow::updateAutoSyncStatus()
+{
+    auto dbWidget = m_ui->tabWidget->currentDatabaseWidget();
+    auto state = dbWidget ? dbWidget->autoSyncState() : DatabaseWidget::AutoSyncState::Disabled;
+    if (state == DatabaseWidget::AutoSyncState::Disabled) {
+        m_syncStatusButton->setVisible(false);
+        return;
+    }
+
+    QString text;
+    QString toolTip = tr("Automatic remote sync: %1").arg(dbWidget->autoSyncRemoteName());
+    switch (state) {
+    case DatabaseWidget::AutoSyncState::InProgress:
+        text = tr("Syncing…");
+        break;
+    case DatabaseWidget::AutoSyncState::Succeeded:
+        text = tr("Synced %1").arg(QLocale().toString(dbWidget->lastAutoSyncTime().time(), QLocale::ShortFormat));
+        break;
+    case DatabaseWidget::AutoSyncState::Failed:
+        text = tr("Sync failed");
+        toolTip.append("\n").append(dbWidget->lastAutoSyncError());
+        break;
+    default:
+        text = tr("Sync now");
+        break;
+    }
+    toolTip.append("\n").append(tr("Click to sync now"));
+
+    m_syncStatusButton->setText(text);
+    m_syncStatusButton->setToolTip(toolTip);
+    m_syncStatusButton->setEnabled(state != DatabaseWidget::AutoSyncState::InProgress);
+    m_syncStatusButton->setVisible(true);
 }
 
 void MainWindow::obtainContextFocusLock()

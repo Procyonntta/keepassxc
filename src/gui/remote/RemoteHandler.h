@@ -20,6 +20,8 @@
 
 #include <QObject>
 
+#include <functional>
+
 class Database;
 class RemoteProcess;
 struct RemoteParams;
@@ -34,7 +36,9 @@ public:
 
     struct RemoteResult
     {
-        bool success;
+        bool success = false;
+        // Set after merging: the downloaded copy received local changes
+        bool needsUpload = false;
         QString errorMessage;
         QString filePath;
         QString stdOutput;
@@ -44,10 +48,17 @@ public:
     RemoteResult download(const RemoteParams* params);
     RemoteResult upload(const QString& filePath, const RemoteParams* params);
 
+    // Non-blocking variants; the callback is dropped if this handler is deleted first
+    void downloadAsync(const RemoteParams& params, std::function<void(RemoteResult)> callback);
+    void uploadAsync(const QString& filePath, const RemoteParams& params, std::function<void(RemoteResult)> callback);
+
     // Used for testing only
     static void setRemoteProcessFunc(std::function<QScopedPointer<RemoteProcess>(QObject*)> func);
 
 private:
+    static RemoteResult runDownload(const RemoteParams& params);
+    static RemoteResult runUpload(const QString& filePath, const RemoteParams& params);
+
     static std::function<QScopedPointer<RemoteProcess>(QObject*)> m_createRemoteProcess;
     static QString m_tempFileLocation;
 

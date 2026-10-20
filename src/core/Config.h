@@ -187,6 +187,8 @@ public:
         KeeShare_Foreign,
         KeeShare_Active,
 
+        RemoteSync_AutoSync,
+
         PasswordGenerator_LowerCase,
         PasswordGenerator_UpperCase,
         PasswordGenerator_Numbers,

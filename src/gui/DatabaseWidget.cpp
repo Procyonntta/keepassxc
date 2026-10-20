@@ -22,11 +22,13 @@
 #include <QBoxLayout>
 #include <QCheckBox>
 #include <QDesktopServices>
+#include <QFile>
 #include <QHostInfo>
 #include <QInputDialog>
 #include <QKeyEvent>
 #include <QPlainTextEdit>
 #include <QProcess>
+#include <QScopeGuard>
 #include <QSplitter>
 #include <QTextDocumentFragment>
 #include <QTextEdit>
@@ -59,6 +61,7 @@
 #include "keeshare/KeeShare.h"
 #include "remote/RemoteHandler.h"
 #include "remote/RemoteSettings.h"
+#include "remote/RemoteSyncScheduler.h"
 
 #ifdef KPXC_FEATURE_NETWORK
 #include "gui/IconDownloaderDialog.h"
@@ -232,6 +235,36 @@ DatabaseWidget::DatabaseWidget(QSharedPointer<Database> db, QWidget* parent)
     m_autosaveTimer = new QTimer(this);
     m_autosaveTimer->setSingleShot(true);
     connect(m_autosaveTimer, SIGNAL(timeout()), this, SLOT(onAutosaveDelayTimeout()));
+
+    m_remoteSyncScheduler = new RemoteSyncScheduler(this);
+    m_autoSyncHandler = new RemoteHandler(this);
+    connect(m_remoteSyncScheduler, &RemoteSyncScheduler::syncRequested, this, &DatabaseWidget::autoSyncWithRemote);
+    connect(m_remoteSyncScheduler, &RemoteSyncScheduler::settingsChanged, this, &DatabaseWidget::autoSyncStateChanged);
+    connect(this, &DatabaseWidget::databaseUnlocked, this, [this] {
+        m_remoteSyncScheduler->setFilePath(m_db->canonicalFilePath());
+        m_remoteSyncScheduler->databaseUnlocked();
+    });
+    connect(this, &DatabaseWidget::databaseFilePathChanged, this, [this] {
+        m_remoteSyncScheduler->setFilePath(m_db->canonicalFilePath());
+    });
+    connect(this, &DatabaseWidget::databaseLocked, this, [this] {
+        m_remoteSyncScheduler->databaseLocked();
+        m_autoSyncPending = false;
+        emit autoSyncStateChanged();
+    });
+    connect(this, &DatabaseWidget::databaseSaved, this, [this] {
+        // Saves made by the sync itself must not schedule another sync
+        if (m_syncMerging || !m_remoteSyncScheduler->isActive()) {
+            return;
+        }
+        if (m_syncInProgress || m_autoSyncPending) {
+            // Changes saved while a sync runs or waits are picked up right after it
+            m_autoSyncPending = m_autoSyncPending || m_remoteSyncScheduler->currentSettings().onSave;
+            QTimer::singleShot(0, this, &DatabaseWidget::resumePendingAutoSync);
+            return;
+        }
+        m_remoteSyncScheduler->databaseSaved();
+    });
 
     m_searchLimitGroup = config()->get(Config::SearchLimitGroup).toBool();
 
@@ -1153,6 +1186,7 @@ int DatabaseWidget::addChildWidget(QWidget* w)
 void DatabaseWidget::syncWithRemote(const RemoteParams* params)
 {
     setDisabled(true);
+    m_syncInProgress = true;
     emit databaseSyncInProgress();
 
     QScopedPointer<RemoteHandler> remoteHandler(new RemoteHandler(this));
@@ -1175,7 +1209,7 @@ void DatabaseWidget::syncWithRemote(const RemoteParams* params)
                 return;
             }
             remoteDb->markAsTemporaryDatabase();
-            if (!syncWithDatabase(remoteDb, error)) {
+            if (!syncWithDatabase(remoteDb, error, &result.needsUpload)) {
                 // Something failed during the sync process
                 result.success = false;
                 result.errorMessage = error;
@@ -1205,7 +1239,7 @@ void DatabaseWidget::syncDatabaseWithLockedDatabase(const QString& filePath, con
 void DatabaseWidget::uploadAndFinishSync(const RemoteParams* params, RemoteHandler::RemoteResult result)
 {
     QScopedPointer<RemoteHandler> remoteHandler(new RemoteHandler(this));
-    if (result.success && !params->uploadCommand.isEmpty()) {
+    if (result.success && result.needsUpload && !params->uploadCommand.isEmpty()) {
         emit updateSyncProgress(75, tr("Uploading..."));
         result = remoteHandler->upload(result.filePath, params);
     }
@@ -1215,7 +1249,13 @@ void DatabaseWidget::uploadAndFinishSync(const RemoteParams* params, RemoteHandl
 
 void DatabaseWidget::finishSync(const RemoteParams* params, RemoteHandler::RemoteResult result)
 {
+    // The downloaded copy is not needed anymore
+    if (!result.filePath.isEmpty()) {
+        QFile::remove(result.filePath);
+    }
+
     setDisabled(false);
+    m_syncInProgress = false;
     emit updateSyncProgress(-1, "");
     if (result.success) {
         emit databaseSyncCompleted(params->name);
@@ -1229,6 +1269,163 @@ void DatabaseWidget::finishSync(const RemoteParams* params, RemoteHandler::Remot
 QList<RemoteParams*> DatabaseWidget::getRemoteParams() const
 {
     return m_remoteSettings->getAllRemoteParams();
+}
+
+DatabaseWidget::AutoSyncState DatabaseWidget::autoSyncState() const
+{
+    if (!m_remoteSyncScheduler->isActive()) {
+        return AutoSyncState::Disabled;
+    }
+    return m_autoSyncState;
+}
+
+QString DatabaseWidget::autoSyncRemoteName() const
+{
+    return m_remoteSyncScheduler->currentSettings().remoteName;
+}
+
+QDateTime DatabaseWidget::lastAutoSyncTime() const
+{
+    return m_lastAutoSyncTime;
+}
+
+QString DatabaseWidget::lastAutoSyncError() const
+{
+    return m_lastAutoSyncError;
+}
+
+void DatabaseWidget::autoSyncNow()
+{
+    m_remoteSyncScheduler->requestSync();
+}
+
+bool DatabaseWidget::canAutoSync() const
+{
+    return !isLocked() && !m_reloading && !m_syncInProgress && !isSaving() && !m_db->isModified()
+           && currentMode() == Mode::ViewMode;
+}
+
+void DatabaseWidget::autoSyncWithRemote(const QString& remoteName)
+{
+    if (!canAutoSync()) {
+        // Try again once the user is done editing or the changes are saved
+        if (!isLocked() && !m_syncInProgress) {
+            m_autoSyncPending = true;
+        }
+        return;
+    }
+    m_autoSyncPending = false;
+
+    auto params = m_remoteSettings->getRemoteParams(remoteName);
+    if (!params || params->downloadCommand.isEmpty()) {
+        RemoteHandler::RemoteResult result;
+        result.errorMessage = tr("Remote sync '%1' has no download command.").arg(remoteName);
+        finishAutoSync(result);
+        return;
+    }
+
+    m_syncInProgress = true;
+    m_autoSyncState = AutoSyncState::InProgress;
+    emit autoSyncStateChanged();
+
+    // Keep a copy, the remote settings are reloaded whenever the database is modified
+    RemoteParams paramsCopy = *params;
+    m_autoSyncHandler->downloadAsync(paramsCopy, [this, paramsCopy](RemoteHandler::RemoteResult result) {
+        mergeAutoSyncDownload(paramsCopy, std::move(result));
+    });
+}
+
+void DatabaseWidget::mergeAutoSyncDownload(const RemoteParams& params, RemoteHandler::RemoteResult result)
+{
+    if (!result.success) {
+        finishAutoSync(result);
+        return;
+    }
+    if (isLocked()) {
+        cancelAutoSync(result, false);
+        return;
+    }
+    if (m_reloading || isSaving() || m_db->isModified() || currentMode() != Mode::ViewMode) {
+        // The user started working with the database during the download
+        cancelAutoSync(result, true);
+        return;
+    }
+
+    // Opening and saving run nested event loops, keep the user and lock() away meanwhile
+    m_syncMerging = true;
+    setDisabled(true);
+
+    QString error;
+    auto remoteDb = QSharedPointer<Database>::create();
+    if (remoteDb->open(result.filePath, m_db->key(), &error)) {
+        remoteDb->markAsTemporaryDatabase();
+        result.success = syncWithDatabase(remoteDb, error, &result.needsUpload);
+    } else {
+        result.success = false;
+        error = tr("The remote database cannot be opened with the current credentials: %1").arg(error);
+    }
+    result.errorMessage = error;
+    remoteDb.reset();
+
+    setDisabled(false);
+    m_syncMerging = false;
+    emit updateSyncProgress(-1, "");
+
+    if (result.success && result.needsUpload && !params.uploadCommand.isEmpty()) {
+        m_autoSyncHandler->uploadAsync(
+            result.filePath, params, [this](const RemoteHandler::RemoteResult& uploaded) { finishAutoSync(uploaded); });
+        return;
+    }
+    finishAutoSync(result);
+}
+
+void DatabaseWidget::cancelAutoSync(const RemoteHandler::RemoteResult& result, bool retry)
+{
+    if (!result.filePath.isEmpty()) {
+        QFile::remove(result.filePath);
+    }
+    m_syncInProgress = false;
+    m_autoSyncPending = retry;
+    if (!m_lastAutoSyncError.isEmpty()) {
+        m_autoSyncState = AutoSyncState::Failed;
+    } else if (m_lastAutoSyncTime.isValid()) {
+        m_autoSyncState = AutoSyncState::Succeeded;
+    } else {
+        m_autoSyncState = AutoSyncState::Idle;
+    }
+    emit autoSyncStateChanged();
+}
+
+void DatabaseWidget::finishAutoSync(const RemoteHandler::RemoteResult& result)
+{
+    if (!result.filePath.isEmpty()) {
+        QFile::remove(result.filePath);
+    }
+    m_syncInProgress = false;
+
+    bool wasFailing = m_remoteSyncScheduler->isFailing();
+    m_remoteSyncScheduler->syncFinished(result.success);
+    if (result.success) {
+        m_autoSyncState = AutoSyncState::Succeeded;
+        m_lastAutoSyncTime = QDateTime::currentDateTime();
+        m_lastAutoSyncError.clear();
+    } else {
+        m_autoSyncState = AutoSyncState::Failed;
+        m_lastAutoSyncError = result.errorMessage;
+        // Only report the first failure, retries happen in the background
+        if (!wasFailing && !isLocked()) {
+            showErrorMessage(tr("Automatic remote sync failed: %1").arg(result.errorMessage));
+        }
+    }
+    emit autoSyncStateChanged();
+    resumePendingAutoSync();
+}
+
+void DatabaseWidget::resumePendingAutoSync()
+{
+    if (m_autoSyncPending && canAutoSync()) {
+        m_remoteSyncScheduler->requestSync();
+    }
 }
 
 void DatabaseWidget::switchToMainView(bool previousDialogAccepted)
@@ -1258,6 +1455,11 @@ void DatabaseWidget::switchToMainView(bool previousDialogAccepted)
     } else {
         // Workaround: ensure entries are focused so search doesn't reset
         m_entryView->setFocus();
+    }
+
+    // Run an automatic sync that was postponed while editing
+    if (m_autoSyncPending) {
+        QTimer::singleShot(0, this, &DatabaseWidget::resumePendingAutoSync);
     }
 }
 
@@ -1436,7 +1638,7 @@ void DatabaseWidget::syncUnlockedDatabase(bool accepted)
 
         RemoteHandler::RemoteResult result;
         QString error;
-        result.success = syncWithDatabase(destinationDb, error);
+        result.success = syncWithDatabase(destinationDb, error, &result.needsUpload);
         result.errorMessage = error;
         result.filePath = destinationDb->filePath();
 
@@ -1445,19 +1647,31 @@ void DatabaseWidget::syncUnlockedDatabase(bool accepted)
     switchToMainView();
 }
 
-bool DatabaseWidget::syncWithDatabase(const QSharedPointer<Database>& otherDb, QString& error)
+bool DatabaseWidget::syncWithDatabase(const QSharedPointer<Database>& otherDb, QString& error, bool* remoteChanged)
 {
-    emit updateSyncProgress(50, tr("Syncing..."));
-    Merger firstMerge(m_db.data(), otherDb.data());
-    Merger secondMerge(otherDb.data(), m_db.data());
-    auto changeList = firstMerge.merge() + secondMerge.merge();
+    // Saves made here belong to the sync and must not schedule another one
+    const bool wasMerging = m_syncMerging;
+    m_syncMerging = true;
+    auto restoreMerging = qScopeGuard([this, wasMerging] { m_syncMerging = wasMerging; });
 
-    if (!changeList.isEmpty()) {
-        // Save synced databases
+    emit updateSyncProgress(50, tr("Syncing..."));
+    Merger toRemote(m_db.data(), otherDb.data());
+    Merger toLocal(otherDb.data(), m_db.data());
+    auto remoteChanges = toRemote.merge();
+    auto localChanges = toLocal.merge();
+
+    if (remoteChanged) {
+        *remoteChanged = !remoteChanges.isEmpty();
+    }
+
+    // Save the local database when the merge changed it or its unsaved changes are about to be uploaded
+    if (!localChanges.isEmpty() || (!remoteChanges.isEmpty() && m_db->isModified())) {
         if (!save()) {
             error = tr("Error while saving database %1: %2").arg(m_db->filePath(), error);
             return false;
         }
+    }
+    if (!remoteChanges.isEmpty()) {
         if (!otherDb->save(Database::Atomic, {}, &error)) {
             error = tr("Error while saving database %1: %2").arg(otherDb->filePath(), error);
             return false;
@@ -2029,7 +2243,7 @@ bool DatabaseWidget::lock()
     }
 
     // Don't try to lock the database while saving, this will cause a deadlock
-    if (m_db->isSaving()) {
+    if (m_db->isSaving() || m_syncMerging) {
         QTimer::singleShot(200, this, SLOT(lock()));
         return false;
     }
