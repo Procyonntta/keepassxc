@@ -43,6 +43,12 @@ private slots:
     void testRemoteSyncDatabaseSameKey();
     void testRemoteSyncDatabaseRequiresPassword();
     void testOpenRemoteDatabase();
+    void testAutoSyncRequiresLocalOptIn();
+    void testAutoSyncOnUnlock();
+    void testAutoSyncAfterSave();
+    void testAutoSyncSkipsUploadWithoutChanges();
+    void testAutoSyncDeferredWhileEditing();
+    void testAutoSyncSettings();
     void testAutoreloadDatabase();
     void testTabs();
     void testEditEntry();
@@ -91,6 +97,9 @@ private:
     void checkSaveDatabase();
     void checkStatusBarText(const QString& textFragment);
     void prepareAndTriggerRemoteSync();
+    void setupAutoSync(bool onUnlock, bool onSave);
+    Entry* addLocalEntryForSync();
+    bool remoteDatabaseContains(const Entry* entry);
 
     QScopedPointer<MainWindow> m_mainWindow;
     QPointer<QLabel> m_statusBarLabel;
@@ -100,6 +109,7 @@ private:
     TemporaryFile m_dbFile;
     QString m_dbFileName;
     QString m_dbFilePath;
+    TemporaryFile m_remoteDbFile;
 };
 
 #endif // KEEPASSX_TESTGUI_H

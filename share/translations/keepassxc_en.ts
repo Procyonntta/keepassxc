@@ -2643,6 +2643,82 @@ The command has to exit. In case of `sftp` as last command `exit` has to be sent
         <source> seconds</source>
         <translation type="unfinished"></translation>
     </message>
+    <message>
+        <source>Template</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Command template</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Fill in the commands for a common tool, then adjust the remote path</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Sync automatically on this device</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Sync with</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Remote used for automatic sync</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>When</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>After unlocking</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>After saving</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Every</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Automatic sync interval</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>never</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source> min</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>This choice is stored on this computer only. Sync commands travel with the database file, so they never run automatically on a device where this is not enabled.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Choose a template…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>rclone (Google Drive, Dropbox, OneDrive, WebDAV, S3, …)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>scp (SSH server)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Choose a sync command and at least one moment to sync automatically.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Replace %1 with the location of your database in both commands, then press Save.</source>
+        <translation type="unfinished"></translation>
+    </message>
 </context>
 <context>
     <name>DatabaseTabWidget</name>
@@ -2981,6 +3057,18 @@ Disable safe saves and try again?</source>
     </message>
     <message>
         <source>Merge canceled, no changes were made.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Remote sync &apos;%1&apos; has no download command.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>The remote database cannot be opened with the current credentials: %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Automatic remote sync failed: %1</source>
         <translation type="unfinished"></translation>
     </message>
 </context>
@@ -6504,6 +6592,34 @@ This version is not meant for production use.</source>
             <numerusform></numerusform>
             <numerusform></numerusform>
         </translation>
+    </message>
+    <message>
+        <source>Sync Now</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Automatic remote sync: %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Syncing…</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Synced %1</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Sync failed</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Sync now</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <source>Click to sync now</source>
+        <translation type="unfinished"></translation>
     </message>
 </context>
 <context>

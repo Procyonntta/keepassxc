@@ -25,6 +25,7 @@
 #include <QProgressBar>
 #include <QSystemTrayIcon>
 #include <QTimer>
+#include <QToolButton>
 
 #include "core/SignalMultiplexer.h"
 #include "gui/DatabaseWidget.h"
@@ -152,6 +153,7 @@ private slots:
     void updateTrayIcon();
     void updateProgressBar(int percentage, QString message);
     void updateEntryCountLabel();
+    void updateAutoSyncStatus();
     void focusSearchWidget();
     void enableMenuAndToolbar();
     void disableMenuAndToolbar();
@@ -190,6 +192,7 @@ private:
     QPointer<QProgressBar> m_progressBar;
     QPointer<QLabel> m_progressBarLabel;
     QPointer<QLabel> m_statusBarLabel;
+    QPointer<QToolButton> m_syncStatusButton;
 
     Q_DISABLE_COPY(MainWindow)
 

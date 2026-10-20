@@ -19,6 +19,7 @@
 #ifndef KEEPASSX_DATABASEWIDGET_H
 #define KEEPASSX_DATABASEWIDGET_H
 
+#include <QDateTime>
 #include <QStackedWidget>
 
 #include "core/Database.h"
@@ -46,6 +47,7 @@ class EntryPreviewWidget;
 class TagView;
 class ElidedLabel;
 class RemoteSettings;
+class RemoteSyncScheduler;
 struct RemoteParams;
 
 namespace Ui
@@ -69,6 +71,15 @@ public:
         LockedMode,
         ReportsMode,
         DatabaseSettingsMode
+    };
+
+    enum class AutoSyncState
+    {
+        Disabled,
+        Idle,
+        InProgress,
+        Succeeded,
+        Failed
     };
 
     explicit DatabaseWidget(QSharedPointer<Database> db, QWidget* parent = nullptr);
@@ -132,6 +143,11 @@ public:
     void syncDatabaseWithLockedDatabase(const QString& filePath, const RemoteParams* params);
     QList<RemoteParams*> getRemoteParams() const;
 
+    AutoSyncState autoSyncState() const;
+    QString autoSyncRemoteName() const;
+    QDateTime lastAutoSyncTime() const;
+    QString lastAutoSyncError() const;
+
 signals:
     // relayed Database signals
     void databaseFilePathChanged(const QString& oldPath, const QString& newPath);
@@ -160,6 +176,7 @@ signals:
     void databaseSyncUnlocked(const RemoteHandler::RemoteResult& result);
     void unlockDatabaseInDialogForSync(const QString& filePath);
     void updateSyncProgress(int percentage, QString message);
+    void autoSyncStateChanged();
     void groupContextMenuRequested(const QPoint& globalPos);
     void entryContextMenuRequested(const QPoint& globalPos);
     void listModeAboutToActivate();
@@ -235,6 +252,7 @@ public slots:
     void switchToDatabaseReports();
     void switchToDatabaseSettings();
     void switchToRemoteSettings();
+    void autoSyncNow();
 #ifdef KPXC_FEATURE_BROWSER
     void switchToPasskeys();
     void showImportPasskeyDialog(bool isEntry = false);
@@ -287,9 +305,10 @@ private slots:
     void unlockDatabase(bool accepted);
     void mergeDatabase(bool accepted);
     void syncUnlockedDatabase(bool accepted);
-    bool syncWithDatabase(const QSharedPointer<Database>& otherDb, QString& error);
+    bool syncWithDatabase(const QSharedPointer<Database>& otherDb, QString& error, bool* remoteChanged = nullptr);
     void uploadAndFinishSync(const RemoteParams* params, RemoteHandler::RemoteResult result);
     void finishSync(const RemoteParams* params, RemoteHandler::RemoteResult result);
+    void autoSyncWithRemote(const QString& remoteName);
     void emitCurrentModeChanged();
     // Database autoreload slots
     void reloadDatabaseFile(bool triggeredBySave);
@@ -302,6 +321,11 @@ private:
     void openDatabaseFromEntry(const Entry* entry, bool inBackground = true);
     void performIconDownloads(const QList<Entry*>& entries, bool force = false, bool downloadInBackground = false);
     bool performSave(QString& errorMessage, const QString& fileName = {});
+    bool canAutoSync() const;
+    void mergeAutoSyncDownload(const RemoteParams& params, RemoteHandler::RemoteResult result);
+    void cancelAutoSync(const RemoteHandler::RemoteResult& result, bool retry);
+    void finishAutoSync(const RemoteHandler::RemoteResult& result);
+    void resumePendingAutoSync();
 
     QSharedPointer<Database> m_db;
 
@@ -334,6 +358,16 @@ private:
     bool m_attemptingLock = false;
 
     QScopedPointer<RemoteSettings> m_remoteSettings;
+
+    // Automatic remote sync
+    QPointer<RemoteSyncScheduler> m_remoteSyncScheduler;
+    QPointer<RemoteHandler> m_autoSyncHandler;
+    bool m_syncInProgress = false;
+    bool m_syncMerging = false;
+    bool m_autoSyncPending = false;
+    AutoSyncState m_autoSyncState = AutoSyncState::Idle;
+    QDateTime m_lastAutoSyncTime;
+    QString m_lastAutoSyncError;
 
     // Search state
     QScopedPointer<EntrySearcher> m_entrySearcher;
